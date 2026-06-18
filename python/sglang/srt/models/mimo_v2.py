@@ -760,7 +760,6 @@ class MiMoV2DecoderLayer(nn.Module):
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
-
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.layernorm_epsilon
@@ -792,14 +791,12 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
-
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -818,14 +815,12 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
-
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
-
         return hidden_states, residual
 
     def is_moe_layer(self, layer_idx: int) -> bool:
@@ -940,6 +935,10 @@ class MiMoV2Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+        self.layers_to_capture = []
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = layers_to_capture
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
@@ -969,7 +968,9 @@ class MiMoV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if forward_batch.can_run_tbo:
+        aux_hidden_states = []
+
+        if forward_batch.can_run_tbo and not self.layers_to_capture:
             tbo_start_layer = self.start_layer
             tbo_end_layer = self.end_layer
 
@@ -998,6 +999,10 @@ class MiMoV2Model(nn.Module):
             )
         else:
             for i in range(self.start_layer, self.end_layer):
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states if residual is None else hidden_states + residual
+                    )
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -1005,6 +1010,11 @@ class MiMoV2Model(nn.Module):
                     forward_batch,
                     residual,
                 )
+
+        if self.end_layer in self.layers_to_capture:
+            aux_hidden_states.append(
+                hidden_states if residual is None else hidden_states + residual
+            )
 
         hidden_states_before_norm = None
         if not self.pp_group.is_last_rank:
@@ -1024,6 +1034,9 @@ class MiMoV2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) != 0:
+            hidden_states = (hidden_states, aux_hidden_states)
 
         return hidden_states, hidden_states_before_norm
 
@@ -1124,6 +1137,7 @@ class MiMoV2ForCausalLM(nn.Module):
                 if isinstance(layer.mlp, MiMoV2MoE)
             }
         )
+        self.capture_aux_hidden_states = False
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -1187,12 +1201,17 @@ class MiMoV2ForCausalLM(nn.Module):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             logits_output = self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
+                aux_hidden_states,
                 hidden_states_before_norm=hidden_states_before_norm,
             )
             return logits_output
@@ -1417,6 +1436,12 @@ class MiMoV2ForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    # MiMo FP4/DFlash uses checkpoint keys named *.weight_scale,
+                    # while the FP8/MXFP4 quant path registers *_weight_scale_inv.
+                    if name not in params_dict and name.endswith("_weight_scale"):
+                        alt_name = f"{name}_inv"
+                        if alt_name in params_dict:
+                            name = alt_name
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -1457,6 +1482,18 @@ class MiMoV2ForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

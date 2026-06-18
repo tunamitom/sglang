@@ -33,6 +33,10 @@ from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
+import os as _os
+
+_DFLASH_DUMP_DIR = _os.environ.get("DFLASH_DUMP_DIR")
+
 _FusedKVMaterializeHelper = None
 
 
@@ -99,7 +103,7 @@ class DFlashWorker:
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
-        supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton")
+        supported_draft_backends = ("b12x", "flashinfer", "fa3", "fa4", "triton")
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()
         if draft_backend is None:
@@ -130,6 +134,8 @@ class DFlashWorker:
                 _fb,
             )
             draft_backend = _fb
+        if _os.environ.get("DFLASH_DRAFT_DISABLE_CUDA_GRAPH") == "1":
+            draft_server_args.disable_cuda_graph = True
         # Make the draft worker backend explicit and self-contained (no further overrides).
         draft_server_args.speculative_draft_attention_backend = None
         draft_server_args.prefill_attention_backend = None
@@ -184,6 +190,10 @@ class DFlashWorker:
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
+        # The DFlash checkpoint ships the trained mask-token embedding separately
+        # (mask_embedding.pt); the target model's embedding row for the mask token
+        # is untrained (~zero), so using it starves the draft of signal.
+        self._mask_token_embedding = self._load_mask_token_embedding()
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -232,6 +242,53 @@ class DFlashWorker:
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
+    def _load_mask_token_embedding(self) -> Optional[torch.Tensor]:
+        draft_path = self.server_args.speculative_draft_model_path
+        if not draft_path:
+            return None
+        path = _os.path.join(draft_path, "mask_embedding.pt")
+        if not _os.path.exists(path):
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH mask_embedding.pt not found at %s; falling back to the "
+                    "target embedding row for the mask token.",
+                    path,
+                )
+            return None
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        emb = payload["embedding"] if isinstance(payload, dict) else payload
+        emb_token_id = (
+            payload.get("mask_token_id") if isinstance(payload, dict) else None
+        )
+        if emb_token_id is not None and int(emb_token_id) != int(self._mask_token_id):
+            raise ValueError(
+                "DFLASH mask_embedding.pt token id mismatch: "
+                f"{emb_token_id} vs resolved {self._mask_token_id}."
+            )
+        target_dtype = self.target_worker.model_runner.dtype
+        emb = emb.to(device=self.device, dtype=target_dtype)
+        if self.tp_rank == 0:
+            logger.info(
+                "DFLASH loaded mask token embedding from %s (norm=%.3f).",
+                path,
+                float(emb.float().norm()),
+            )
+        return emb
+
+    def _dump_step(self, rec: dict) -> None:
+        if not _DFLASH_DUMP_DIR or self.tp_rank != 0:
+            return
+        try:
+            _os.makedirs(_DFLASH_DUMP_DIR, exist_ok=True)
+            n = getattr(self, "_dump_counter", 0)
+            if n > 400:
+                return
+            self._dump_counter = n + 1
+            rec["step"] = n
+            torch.save(rec, _os.path.join(_DFLASH_DUMP_DIR, f"step{n}.pt"))
+        except Exception as e:
+            logger.warning("DFLASH dump failed: %s", e)
+
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
         try:
@@ -250,7 +307,7 @@ class DFlashWorker:
 
                 # Keep semantics aligned with set_kv_buffer scaling behavior.
                 k_scale = getattr(attn.attn, "k_scale", None)
-                v_scale = getattr(attn.attn, "v_scale", None)
+                v_scale = getattr(attn, "v_scale", getattr(attn.attn, "v_scale", None))
                 if k_scale is not None and not math.isclose(float(k_scale), 1.0):
                     fused_disable_reason = (
                         "non-unit k_scale is not supported for fused KV path: "
@@ -573,6 +630,10 @@ class DFlashWorker:
         block_ids[:, 0].copy_(draft_input.bonus_tokens.to(torch.long))
 
         noise_embedding = embed_module(block_ids)
+        if self._mask_token_embedding is not None:
+            noise_embedding[block_ids == int(self._mask_token_id)] = (
+                self._mask_token_embedding
+            )
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         # For spec-v1, the draft KV cache is always materialized before drafting the
@@ -598,6 +659,130 @@ class DFlashWorker:
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
+        draft_tokens = self._draft_block_tokens_buf[:bs]
+        draft_tokens[:, 0].copy_(block_ids[:, 0])
+
+        if False and self.block_size > 2:
+            step_spec_info = DFlashVerifyInput(
+                draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
+                positions=torch.empty((0,), dtype=torch.int64, device=self.device),
+                draft_token_num=2,
+                custom_mask=None,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
+            step_ids = block_ids[:, :2]
+            step_positions_2d = positions_2d[:, :2]
+            step_block_end = self._draft_block_end_buf[:bs]
+            seq_lens_sum = int(draft_prefix_lens.sum().item())
+
+            for step in range(1, int(self.block_size)):
+                step_ids[:, 0].copy_(draft_tokens[:, step - 1])
+                step_ids[:, 1].fill_(int(self._mask_token_id))
+                step_positions_2d[:, 0].copy_(target_prefix_lens + (step - 1))
+                step_positions_2d[:, 1].copy_(target_prefix_lens + step)
+                step_positions = step_positions_2d.reshape(-1)
+                step_embeds = embed_module(step_ids).view(bs * 2, -1)
+                torch.add(draft_prefix_lens, 2, out=step_block_end)
+
+                token_to_kv_pool_state_backup = allocator.backup_state()
+                try:
+                    if self.page_size == 1:
+                        step_cache_loc = allocator.alloc(bs * 2)
+                    else:
+                        step_end_cpu = seq_lens_cpu + 2
+                        last_loc = get_last_loc(
+                            self.draft_model_runner.req_to_token_pool.req_to_token,
+                            batch.req_pool_indices,
+                            draft_prefix_lens,
+                        )
+                        step_cache_loc = allocator.alloc_extend(
+                            draft_prefix_lens,
+                            seq_lens_cpu,
+                            step_block_end,
+                            step_end_cpu,
+                            last_loc,
+                            bs * 2,
+                        )
+                    if step_cache_loc is None:
+                        raise RuntimeError(
+                            f"DFLASH draft OOM when allocating {bs * 2} step tokens."
+                        )
+
+                    assign_req_to_token_pool_func(
+                        batch.req_pool_indices,
+                        self.draft_model_runner.req_to_token_pool.req_to_token,
+                        draft_prefix_lens,
+                        step_block_end,
+                        step_cache_loc,
+                        bs,
+                    )
+
+                    forward_batch = ForwardBatch(
+                        forward_mode=ForwardMode.TARGET_VERIFY,
+                        batch_size=bs,
+                        input_ids=step_ids.flatten(),
+                        req_pool_indices=batch.req_pool_indices,
+                        seq_lens=draft_prefix_lens,
+                        out_cache_loc=step_cache_loc,
+                        seq_lens_sum=seq_lens_sum,
+                        seq_lens_cpu=seq_lens_cpu,
+                        positions=step_positions,
+                        req_to_token_pool=self.draft_model_runner.req_to_token_pool,
+                        token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
+                        attn_backend=self.draft_model_runner.attn_backend,
+                        input_embeds=step_embeds,
+                        spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                        spec_info=step_spec_info,
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                    )
+
+                    with torch.inference_mode():
+                        step_output = self.draft_model_runner.forward(
+                            forward_batch
+                        ).logits_output
+                finally:
+                    allocator.restore_state(token_to_kv_pool_state_backup)
+
+                step_hidden = step_output.hidden_states
+                if step_hidden is None:
+                    raise RuntimeError("DFLASH draft model returned no hidden states.")
+                step_hidden = step_hidden.view(bs, 2, -1)
+                draft_tokens[:, step].copy_(
+                    self._greedy_sample_from_vocab_parallel_head(
+                        hidden_states=step_hidden[:, 1, :],
+                        lm_head=lm_head,
+                    )
+                )
+
+            torch.add(
+                target_prefix_lens.unsqueeze(1),
+                self._block_pos_offsets,
+                out=positions_2d,
+            )
+            positions = positions_2d.reshape(-1)
+            verify_input = DFlashVerifyInput(
+                draft_token=draft_tokens.reshape(-1),
+                positions=positions,
+                draft_token_num=self.block_size,
+            )
+            _, build_custom_mask = resolve_dflash_verify_mask_policy(
+                self.model_runner.attn_backend
+            )
+            verify_input.prepare_for_verify(
+                batch,
+                self.page_size,
+                build_custom_mask=build_custom_mask,
+            )
+
+            batch.forward_mode = (
+                ForwardMode.TARGET_VERIFY
+                if not batch.forward_mode.is_idle()
+                else ForwardMode.IDLE
+            )
+            batch.spec_info = verify_input
+            batch.return_hidden_states = False
+            return
+
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
             if self.page_size == 1:
@@ -672,8 +857,6 @@ class DFlashWorker:
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
         ).view(bs, self.block_size - 1)
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
         positions = positions_2d.reshape(-1)
 
@@ -1172,6 +1355,23 @@ class DFlashWorker:
                     else _to_int32_device_tensor(model_worker_batch.extend_prefix_lens)
                 ),
             )
+            if _DFLASH_DUMP_DIR and batch.batch_size() == 1:
+                self._dump_step(
+                    {
+                        "phase": "prefill",
+                        "tokens": model_worker_batch.input_ids.detach().cpu(),
+                        "target_hidden": draft_input.target_hidden.detach()
+                        .to(torch.bfloat16)
+                        .cpu()
+                        if draft_input.target_hidden is not None
+                        and draft_input.target_hidden.numel() > 0
+                        else logits_output.hidden_states.detach()
+                        .to(torch.bfloat16)
+                        .cpu(),
+                        "bonus": int(next_token_ids[0].item()),
+                        "draft_tokens": None,
+                    }
+                )
             self._append_target_hidden_to_draft_kv(batch, draft_input)
             batch.spec_info = draft_input
 
@@ -1212,6 +1412,59 @@ class DFlashWorker:
             batch_result.can_run_cuda_graph,
         )
 
+        if _os.environ.get("DFLASH_VERIFY_AB") == "1" and can_run_cuda_graph:
+            # Re-run the same verify forward eagerly (collective: every TP rank
+            # must participate) and dump graph-vs-eager argmax for comparison.
+            from sglang.srt.model_executor.forward_batch_info import (
+                ForwardBatch as _FB,
+            )
+
+            runner = self.target_worker.model_runner
+            fb2 = _FB.init_new(model_worker_batch, runner)
+            _saved_graph_runner = runner.graph_runner
+            runner.graph_runner = None
+            try:
+                out2 = runner.forward(fb2)
+            finally:
+                runner.graph_runner = _saved_graph_runner
+            eager_logits = out2.logits_output.next_token_logits
+            graph_hidden = logits_output.hidden_states
+            eager_hidden = out2.logits_output.hidden_states
+            hidden_maxdiff = None
+            hidden_token_maxdiff = None
+            hidden_shapes = None
+            if graph_hidden is not None and eager_hidden is not None:
+                common_tokens = min(graph_hidden.shape[0], eager_hidden.shape[0])
+                hidden_delta = (
+                    graph_hidden[:common_tokens] - eager_hidden[:common_tokens]
+                ).abs()
+                hidden_maxdiff = float(hidden_delta.max().item())
+                hidden_token_maxdiff = hidden_delta.amax(dim=-1).detach().cpu()
+                hidden_shapes = (tuple(graph_hidden.shape), tuple(eager_hidden.shape))
+            self._dump_step(
+                {
+                    "phase": "ab",
+                    "tokens": verify_input.draft_token.detach().cpu(),
+                    "target_hidden": torch.empty((0, 1)),
+                    "bonus": -1,
+                    "draft_tokens": verify_input.draft_token.detach().cpu(),
+                    "graph_argmax": logits_output.next_token_logits.argmax(-1)
+                    .detach()
+                    .cpu(),
+                    "eager_argmax": eager_logits.argmax(-1).detach().cpu(),
+                    "logit_maxdiff": float(
+                        (logits_output.next_token_logits - eager_logits)
+                        .abs()
+                        .max()
+                        .item()
+                    ),
+                    "hidden_maxdiff": hidden_maxdiff,
+                    "hidden_token_maxdiff": hidden_token_maxdiff,
+                    "hidden_shapes": hidden_shapes,
+                    "seq_lens": batch.seq_lens.detach().cpu(),
+                }
+            )
+
         (
             new_bonus_tokens,
             commit_lens,
@@ -1228,6 +1481,25 @@ class DFlashWorker:
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
                 commit_lens=commit_lens,
+            )
+
+        if _DFLASH_DUMP_DIR and batch.batch_size() == 1:
+            _commit0 = int(commit_lens[0].item())
+            self._dump_step(
+                {
+                    "phase": "verify",
+                    "tokens": verify_input.draft_token.view(-1)[:_commit0]
+                    .detach()
+                    .cpu(),
+                    "target_hidden": next_target_hidden.detach()
+                    .to(torch.bfloat16)
+                    .cpu(),
+                    "bonus": int(new_bonus_tokens[0].item()),
+                    "draft_tokens": verify_input.draft_token.detach().cpu(),
+                    "target_predict": logits_output.next_token_logits.argmax(-1)
+                    .detach()
+                    .cpu(),
+                }
             )
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens

@@ -77,9 +77,7 @@ def _load_b12x_pcie_oneshot_runtime():
         module = importlib.import_module("b12x.distributed")
     except Exception:
         return None
-    return getattr(module, "PCIeOneshotAllReducePool", None) or getattr(
-        module, "PCIeOneshotAllReduce", None
-    )
+    return getattr(module, "PCIeOneshotAllReduce", None)
 
 
 class CustomAllreduce:
@@ -97,8 +95,8 @@ class CustomAllreduce:
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        device_group: Optional[ProcessGroup] = None,
         max_size=_MAX_CAR_SIZE,
+        nccl_exchange_group: Optional[ProcessGroup] = None,
     ) -> None:
         """
         Args:
@@ -128,7 +126,6 @@ class CustomAllreduce:
         assert isinstance(device, torch.device)
         self.device = device
         self.group = group
-        self.device_group = device_group
         self.rank = rank
         self.world_size = world_size
         self.max_size = max_size
@@ -156,11 +153,19 @@ class CustomAllreduce:
 
             self.max_size = min(max_size, pcie_max_size)
 
+            # The IPC handle exchange runs over NCCL broadcast_object_list,
+            # so it needs the device group rather than the gloo cpu group.
+            # stream_affine=False: the scheduler issues all-reduces from one
+            # thread in a single global order (eager stream vs. graph-capture
+            # stream are never concurrent), so one channel is safe.
             self._pcie_runtime = runtime_cls.from_exchange_group(
-                exchange_group=device_group or group,
+                exchange_group=(
+                    nccl_exchange_group if nccl_exchange_group is not None else group
+                ),
                 device=self.device,
                 eager_buffer_bytes=self.max_size,
                 max_size=self.max_size,
+                stream_affine=False,
             )
         elif not ops.IS_CUSTOM_AR_AVAILABLE:
             # disable because of missing custom allreduce library
@@ -309,9 +314,7 @@ class CustomAllreduce:
 
     def register_graph_buffers(self):
         if self._pcie_runtime is not None:
-            register = getattr(self._pcie_runtime, "register_graph_buffers", None)
-            if register is not None:
-                register()
+            self._pcie_runtime.register_graph_buffers()
             return
         if _is_hip:
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
@@ -342,10 +345,7 @@ class CustomAllreduce:
         if self.disabled:
             return False
         if self._pcie_runtime is not None:
-            should_allreduce = getattr(self._pcie_runtime, "should_allreduce", None)
-            if should_allreduce is not None:
-                return should_allreduce(inp)
-            return self._pcie_runtime.for_stream().should_allreduce(inp)
+            return self._pcie_runtime.should_allreduce(inp)
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
@@ -419,19 +419,9 @@ class CustomAllreduce:
 
     def find_crossover_size(self, nccl_group) -> int:
         if self._pcie_runtime is None:
-            raise RuntimeError(
-                "crossover autotuning is only available for the b12x PCIe oneshot backend"
-            )
-        find_crossover_size = getattr(self._pcie_runtime, "find_crossover_size", None)
-        if find_crossover_size is not None:
-            crossover = find_crossover_size(nccl_group)
-            self.max_size = self._pcie_runtime.max_size
-            return crossover
-
-        channel = self._pcie_runtime.for_stream()
-        crossover = channel.find_crossover_size(nccl_group)
-        self.max_size = channel.max_size
-        self._pcie_runtime.max_size = channel.max_size
+            raise RuntimeError("crossover autotuning is only available for the b12x PCIe oneshot backend")
+        crossover = self._pcie_runtime.find_crossover_size(nccl_group)
+        self.max_size = self._pcie_runtime.max_size
         return crossover
 
     def close(self):
@@ -455,19 +445,11 @@ def dispatch_custom_allreduce():
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
     Otherwise use AiterCustomAllreduce if available.
 
-    On CUDA, the JIT-compiled v2 implementation is used by default unless the
-    b12x PCIe oneshot runtime is requested, which is implemented by the legacy
-    CustomAllreduce class.
-    Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
-    Note: ``ServerArgs._handle_environment_variables`` forces this env to "0" when
-    ``nnodes > 1`` since custom AR is intra-node only.
+    Set SGLANG_USE_JIT_ALL_REDUCE=1 to use the JIT-compiled v2 implementation.
     """
-    pcie_oneshot_enabled, _ = _get_pcie_oneshot_settings()
-    if _is_cuda and pcie_oneshot_enabled:
-        logger.debug("[AR] Using CustomAllreduce for b12x PCIe oneshot")
-        return CustomAllreduce
-
-    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+    # HARDCODED: opt-in flag for v2 JIT all-reduce.
+    # Set SGLANG_USE_JIT_ALL_REDUCE=1 to enable.
+    if _is_cuda and get_bool_env_var("SGLANG_USE_JIT_ALL_REDUCE", default="false"):
         from .custom_all_reduce_v2 import CustomAllReduceV2
 
         logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")

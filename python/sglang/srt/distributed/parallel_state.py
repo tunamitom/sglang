@@ -383,10 +383,20 @@ class GroupCoordinator:
             # Initialize a custom fast all-reduce implementation.
             try:
                 CAClass = dispatch_custom_allreduce()
-                ca_kwargs = dict(group=self.cpu_group, device=self.device)
-                if "device_group" in CAClass.__init__.__code__.co_varnames:
-                    ca_kwargs["device_group"] = self.device_group
-                self.ca_comm = CAClass(**ca_kwargs)
+                try:
+                    # The b12x PCIe oneshot runtime exchanges CUDA IPC handles
+                    # via NCCL broadcast_object_list and therefore needs the
+                    # device group; topology checks keep using the gloo group.
+                    self.ca_comm = CAClass(
+                        group=self.cpu_group,
+                        device=self.device,
+                        nccl_exchange_group=self.device_group,
+                    )
+                except TypeError:
+                    self.ca_comm = CAClass(
+                        group=self.cpu_group,
+                        device=self.device,
+                    )
             except Exception as e:
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "

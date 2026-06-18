@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import inspect
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -976,7 +977,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         layer.b12x_moe_compute_dtype = params_dtype
         if self.quant_config.is_checkpoint_fp8_serialized:
-            params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
+            params_dtype = torch.uint32 if _use_hip_int4 else (torch.uint8 if self.is_fp4_expert else torch.float8_e4m3fn)
         tp_size = get_tensor_model_parallel_world_size()
 
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
@@ -1018,7 +1019,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     2 * intermediate_size_per_partition,
                     hidden_size // 2,
-                    dtype=torch.int8,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             )
@@ -1027,7 +1028,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition // 2,
-                    dtype=torch.int8,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             )
@@ -1106,12 +1107,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.is_fp4_expert:
             fp4_block_k = 32
             use_b12x_source_scale_dtype = get_moe_runner_backend().is_b12x()
-            scale_dtype = (
-                _b12x_fp4_source_scale_dtype()
-                if use_b12x_source_scale_dtype
-                else torch.float32
-            )
-            scale_init = torch.empty if use_b12x_source_scale_dtype else torch.ones
+            # B12X expects float8_e4m3fn swizzled block scales. Checkpoint stores as uint8 (E2M5),
+            # Create as uint8 to preserve raw bytes, convert in _prepare_b12x_fp4_expert_weights
+            scale_dtype = torch.uint8
+            scale_init = torch.zeros if use_b12x_source_scale_dtype else torch.ones
             w13_weight_scale = torch.nn.Parameter(
                 scale_init(
                     num_experts,
@@ -1130,8 +1129,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
                 requires_grad=False,
             )
-            w13_weight_scale.format_ue8m0 = use_b12x_source_scale_dtype
-            w2_weight_scale.format_ue8m0 = use_b12x_source_scale_dtype
+            w13_weight_scale.format_ue8m0 = False
+            w2_weight_scale.format_ue8m0 = False
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
         elif self.block_quant:
@@ -1296,8 +1295,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
                     return
 
-                layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
-                layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+                layer.w13_weight.data = layer.w13_weight.data.view(torch.uint8)
+                layer.w2_weight.data = layer.w2_weight.data.view(torch.uint8)
 
                 if get_moe_runner_backend().is_b12x():
                     self._prepare_b12x_fp4_expert_weights(layer)
@@ -1366,64 +1365,98 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale_inv.format_ue8m0 = True
 
     def _prepare_b12x_fp4_expert_weights(self, layer: Module) -> None:
-        from b12x.moe.fused.w4a16.prepare import prepare_w4a16_mxfp4_native_weights
+        # MiMo FP4 experts store native MXFP4: packed E2M1 weights plus E8M0
+        # K/32 scale bytes (uint8, values ~113-122). B12X W4A16 expects
+        # float8_e4m3fn swizzled block scales at K/16 granularity.
+        #
+        # Steps:
+        # 1. Convert E8M0 K/32 uint8 bytes to representable float8_e4m3fn
+        # 2. Expand from K/32 to K/16 (repeat_interleave 2)
+        # 3. Swizzle into B12X layout via swizzle_blockscale
+        #
+        # E4M3 cannot represent the common MiMo E8M0 scale values 112-117
+        # (2^-15..2^-10) directly. Store scale*64 in the block-scale tensor
+        # for the legacy B12X API, then compensate with the per-expert alpha
+        # tensors below. The scanned DFlash checkpoint range is 112-126, so
+        # this keeps the high-density range representable without saturating
+        # E4M3 or over-amplifying W4A16 accumulators.
+        scale_compensation = 64.0
+        device = layer.w13_weight.device
+        num_experts = layer.w13_weight.shape[0]
 
-        w13_weight = layer.w13_weight.data.view(torch.uint8)
-        w2_weight = layer.w2_weight.data.view(torch.uint8)
-        if not w13_weight.is_contiguous() or not w2_weight.is_contiguous():
-            raise ValueError("b12x W4A16 native MXFP4 weights must be contiguous")
+        def _install_native_e8m0_prepared_weights() -> bool:
+            try:
+                from b12x.integration.tp_moe import b12x_moe_fp4
+                from b12x.moe.fused.w4a16.prepare import (
+                    prepare_w4a16_e8m0_native_weights,
+                )
+            except (ImportError, AttributeError):
+                return False
 
-        device = w13_weight.device
-        num_experts = w13_weight.shape[0]
-        w13_global_scale = torch.ones(num_experts, dtype=torch.float32, device=device)
-        w2_global_scale = torch.ones(num_experts, dtype=torch.float32, device=device)
-        layer.b12x_w4a16_mxfp4_native_weights = prepare_w4a16_mxfp4_native_weights(
-            w13_weight,
-            layer.w13_weight_scale_inv.data,
-            w13_global_scale,
-            w2_weight,
-            layer.w2_weight_scale_inv.data,
-            w2_global_scale,
-            activation="silu",
-            params_dtype=getattr(layer, "b12x_moe_compute_dtype", torch.bfloat16),
-            reuse_input_storage=True,
-        )
-        del w13_global_scale, w2_global_scale
+            if "prepared_w4a16" not in inspect.signature(b12x_moe_fp4).parameters:
+                return False
 
-        # The prepared W4A16 buffers alias and overwrite the loaded native MXFP4
-        # weight storage. Rebind the source params so fallback use fails closed.
-        copy_or_rebind_param(
-            layer,
-            "w13_weight",
-            torch.empty((0,), dtype=layer.w13_weight.dtype, device=device),
-        )
-        copy_or_rebind_param(
-            layer,
-            "w2_weight",
-            torch.empty((0,), dtype=layer.w2_weight.dtype, device=device),
-        )
-        copy_or_rebind_param(
-            layer,
-            "w13_weight_scale_inv",
-            torch.empty(
-                (0,),
-                dtype=layer.w13_weight_scale_inv.dtype,
-                device=device,
-            ),
-        )
-        copy_or_rebind_param(
-            layer,
-            "w2_weight_scale_inv",
-            torch.empty(
-                (0,),
-                dtype=layer.w2_weight_scale_inv.dtype,
-                device=device,
-            ),
-        )
-        layer.w13_weight_scale_inv.format_ue8m0 = True
-        layer.w2_weight_scale_inv.format_ue8m0 = True
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+            activation = getattr(
+                getattr(layer, "moe_runner_config", None), "activation", "silu"
+            )
+            params_dtype = getattr(
+                layer,
+                "b12x_moe_compute_dtype",
+                _b12x_block_fp8_output_dtype(layer),
+            )
+            global_scale = torch.ones(
+                num_experts, dtype=torch.float32, device=device
+            )
+            layer.b12x_prepared_w4a16 = prepare_w4a16_e8m0_native_weights(
+                layer.w13_weight,
+                layer.w13_weight_scale_inv,
+                global_scale,
+                layer.w2_weight,
+                layer.w2_weight_scale_inv,
+                global_scale,
+                activation=activation,
+                params_dtype=params_dtype,
+                w13_layout="w13",
+            )
+            copy_or_rebind_param(
+                layer,
+                "w13_blockscale_swizzled",
+                layer.w13_weight_scale_inv.data.contiguous(),
+            )
+            copy_or_rebind_param(
+                layer,
+                "w2_blockscale_swizzled",
+                layer.w2_weight_scale_inv.data.contiguous(),
+            )
+            return True
+
+        has_native_e8m0_prepared_weights = _install_native_e8m0_prepared_weights()
+
+        def _convert_and_expand_scales(param_name: str):
+            param = getattr(layer, param_name)
+            scale = param.data  # [num_experts, rows, K/32] uint8
+
+            # E8M0 -> compensated E4M3 conversion:
+            # E8M0: value = 2^(byte - 127)
+            e8m0_float = torch.pow(
+                torch.full((), 2.0, dtype=torch.float32, device=scale.device),
+                scale.to(torch.float32) - 127,
+            )
+            e4m3_scale = (e8m0_float * scale_compensation).to(
+                torch.float8_e4m3fn
+            )
+
+            # Expand K/32 -> K/16 (each 32-wide scale -> two 16-wide scales)
+            expanded = e4m3_scale.repeat_interleave(2, dim=-1).contiguous()
+
+            # Swizzle into B12X layout
+            from sglang.srt.layers.quantization.utils import swizzle_blockscale
+            swizzled = swizzle_blockscale(expanded)
+            copy_or_rebind_param(layer, param_name.replace("weight_scale_inv", "blockscale_swizzled"), swizzled)
+
+        if not has_native_e8m0_prepared_weights:
+            _convert_and_expand_scales("w13_weight_scale_inv")
+            _convert_and_expand_scales("w2_weight_scale_inv")
 
         copy_or_rebind_param(
             layer,
@@ -1438,12 +1471,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         copy_or_rebind_param(
             layer,
             "g1_alphas",
-            torch.ones(num_experts, dtype=torch.float32, device=device),
+            torch.full(
+                (num_experts,),
+                1.0 / scale_compensation,
+                dtype=torch.float32,
+                device=device,
+            ),
         )
         copy_or_rebind_param(
             layer,
             "g2_alphas",
-            torch.ones(num_experts, dtype=torch.float32, device=device),
+            torch.full(
+                (num_experts,),
+                1.0 / scale_compensation,
+                dtype=torch.float32,
+                device=device,
+            ),
         )
         layer.w13_input_scale = None
         layer.w2_input_scale = None
@@ -1971,29 +2014,35 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _get_b12x_workspace_pool,
             )
 
+            symm_output.zero_()
             workspace_pool = _get_b12x_workspace_pool(x.device)
-            output = b12x_moe_fp4(
-                a=x,
-                a1_gscale=layer.w13_input_scale_quant,
-                w1_fp4=layer.w13_weight,
-                w1_blockscale=layer.w13_weight_scale_inv,
-                w1_alphas=layer.g1_alphas,
-                a2_gscale=layer.w2_input_scale_quant,
-                w2_fp4=layer.w2_weight,
-                w2_blockscale=layer.w2_weight_scale_inv,
-                w2_alphas=layer.g2_alphas,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                activation=moe_runner_config.activation,
-                quant_mode="w4a16",
-                source_format="mxfp4_native",
-                prepared_w4a16=getattr(layer, "b12x_w4a16_mxfp4_native_weights", None),
-                swiglu_limit=moe_runner_config.swiglu_limit,
-                apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
-                workspace=workspace_pool,
-                output=symm_output,
-                input_scales_static=True,
-            ).to(x.dtype)
+            b12x_kwargs = {
+                "a": x,
+                "a1_gscale": layer.w13_input_scale_quant,
+                "w1_fp4": layer.w13_weight,
+                "w1_blockscale": layer.w13_blockscale_swizzled,
+                "w1_alphas": layer.g1_alphas,
+                "a2_gscale": layer.w2_input_scale_quant,
+                "w2_fp4": layer.w2_weight,
+                "w2_blockscale": layer.w2_blockscale_swizzled,
+                "w2_alphas": layer.g2_alphas,
+                "topk_weights": topk_weights,
+                "topk_ids": topk_ids,
+                "activation": moe_runner_config.activation,
+                "quant_mode": "w4a16",
+                "apply_router_weight_on_input": moe_runner_config.apply_router_weight_on_input,
+                "workspace": workspace_pool,
+                "output": symm_output,
+                "input_scales_are_reciprocal": True,
+                "input_scales_static": True,
+            }
+            b12x_params = inspect.signature(b12x_moe_fp4).parameters
+            prepared_w4a16 = getattr(layer, "b12x_prepared_w4a16", None)
+            if prepared_w4a16 is not None and "prepared_w4a16" in b12x_params:
+                b12x_kwargs["prepared_w4a16"] = prepared_w4a16
+                if "source_format" in b12x_params:
+                    b12x_kwargs["source_format"] = "fp4_e8m0_k32"
+            output = b12x_moe_fp4(**b12x_kwargs).to(x.dtype)
             return StandardCombineInput(hidden_states=output)
 
         if get_moe_runner_backend().is_cutlass():

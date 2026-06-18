@@ -132,10 +132,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
 
+        # DeepSeek-V4 requires a SwiGLU clamp, but MiMo-V2 FP4 experts do not
+        # advertise one. FlashInfer accepts None for unclamped SwiGLU, so only
+        # materialize the per-expert tensor when the model config provides it.
         swiglu_limit = moe_runner_config.swiglu_limit
-        assert (
-            swiglu_limit is not None
-        ), f"swiglu_limit must be non-None for DeepSeek V4 (got {swiglu_limit!r})"
         self._gemm1_clamp_limit_tensor = (
             torch.full(
                 (layer.num_local_experts,),

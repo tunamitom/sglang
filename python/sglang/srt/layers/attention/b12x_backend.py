@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os as _os
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -60,6 +62,14 @@ def _b12x_get_config_attr(cfg, names):
     return None
 
 
+def _b12x_graph_replay_func(name: str):
+    try:
+        from b12x.attention.paged import graph_replay
+    except ImportError:
+        return None
+    return getattr(graph_replay, name, None)
+
+
 @dataclass
 class B12xForwardMetadata:
     cu_seqlens_q: torch.Tensor
@@ -90,6 +100,7 @@ class B12xAttnBackend(AttentionBackend):
         from b12x.integration.attention import PagedAttentionWorkspace
 
         self.workspace_cls = PagedAttentionWorkspace
+        self._is_draft_backend = bool(getattr(model_runner, "is_draft_worker", False))
         self.page_size = model_runner.page_size
         if self.page_size != _B12X_PAGE_SIZE:
             raise ValueError(
@@ -134,12 +145,16 @@ class B12xAttnBackend(AttentionBackend):
         self.max_pages_per_req = (
             self.max_context_len + self.page_size - 1
         ) // self.page_size
+        self.verify_graph_max_cache_seqlen = int(
+            _os.environ.get("B12X_VERIFY_GRAPH_MAX_CACHE_SEQLEN", "0")
+        )
         self.kv_contract_layer_id = self._select_kv_contract_layer_id()
+        model = getattr(model_runner, "model", None)
         self.has_attention_sinks = bool(
             getattr(model_runner.model_config, "has_attention_sinks", False)
-        )
+        ) or self._model_has_attention_sinks(model)
         self.attention_layers = self._collect_attention_layers(
-            getattr(model_runner, "model", None)
+            model
         )
         self.eager_attention_layers = self._collect_eager_attention_layers()
         if self.attention_layers:
@@ -222,6 +237,38 @@ class B12xAttnBackend(AttentionBackend):
     ) -> bool:
         del forward_mode
         return False
+
+    def can_run_cuda_graph_replay(
+        self, forward_batch: ForwardBatch, capture_forward_mode: ForwardMode
+    ) -> bool:
+        if not capture_forward_mode.is_target_verify():
+            return True
+
+        max_cache_seqlen = int(self.verify_graph_max_cache_seqlen)
+        if max_cache_seqlen <= 0:
+            return True
+
+        bs = int(getattr(forward_batch, "batch_size", 0) or 0)
+        if bs <= 0:
+            return True
+
+        tokens_per_req = int(
+            getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", 0)
+            or 0
+        )
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None:
+            if torch.is_tensor(seq_lens_cpu):
+                runtime_max = int(seq_lens_cpu[:bs].max().item())
+            else:
+                runtime_max = max(int(x) for x in seq_lens_cpu[:bs])
+        else:
+            seq_lens = getattr(forward_batch, "seq_lens", None)
+            if seq_lens is None:
+                return True
+            runtime_max = int(seq_lens[:bs].max().item())
+
+        return runtime_max + max(tokens_per_req, 0) <= max_cache_seqlen
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         del max_num_tokens
@@ -388,6 +435,10 @@ class B12xAttnBackend(AttentionBackend):
             reset_decode_preprocess_capture=False,
         )
         self._record_cuda_graph_metadata_ready_for_overlap(mode)
+        if _os.environ.get("DFLASH_B12X_DUMP") == "1" and mode == "verify":
+            self._dump_graph_verify_workspaces(
+                cache_seqlens=cache_seqlens, cu_seqlens_q=cu_seqlens_q
+            )
         self.forward_metadata = B12xForwardMetadata(
             cu_seqlens_q=cu_seqlens_q,
             cache_seqlens=cache_seqlens,
@@ -464,6 +515,9 @@ class B12xAttnBackend(AttentionBackend):
     def get_cuda_graph_metadata_ready_event(self) -> Optional[torch.cuda.Event]:
         return self.cuda_graph_metadata_ready_event
 
+    def on_after_cuda_graph_warmup(self) -> None:
+        pass
+
     def _record_cuda_graph_metadata_ready_for_overlap(self, mode: str) -> None:
         if mode != "decode":
             return
@@ -510,7 +564,6 @@ class B12xAttnBackend(AttentionBackend):
             md.cache_seqlens,
             md.cu_seqlens_q,
             window_left=window_left,
-            active_total_q=md.active_total_q,
         )
 
         k_cache, v_cache = self._get_paged_kv_buffers(
@@ -598,6 +651,14 @@ class B12xAttnBackend(AttentionBackend):
                     f"total_q={q.shape[0]}"
                 )
 
+        if (
+            _os.environ.get("DFLASH_B12X_DUMP") == "1"
+            and md.mode == "verify"
+            and layer.layer_id in (0, 1)
+            and self._layer_is_causal(layer)
+        ):
+            self._dump_verify_workspace_metadata(md, workspace, layer)
+
         k_cache, v_cache = self._get_paged_kv_buffers(
             forward_batch.token_to_kv_pool, layer.layer_id
         )
@@ -622,6 +683,213 @@ class B12xAttnBackend(AttentionBackend):
             attention_sink_bias=sinks,
         )
         return out.view(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+
+    def _dump_graph_verify_workspaces(self, *, cache_seqlens, cu_seqlens_q) -> None:
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return
+            import torch.distributed as _dist
+
+            if _dist.is_initialized() and _dist.get_rank() != 0:
+                return
+            for key, ws in getattr(self, "cuda_graph_workspaces", {}).items():
+                if not key or key[0] != "verify":
+                    continue
+                self._dump_workspace_record(
+                    ws,
+                    tag={"key": tuple(str(k) for k in key)},
+                    use_cuda_graph=True,
+                    layer_id=-1,
+                    mode="verify",
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                )
+        except Exception as e:
+            logger.warning("b12x graph verify metadata dump failed: %s", e)
+
+    def _dump_verify_workspace_metadata(self, md, workspace, layer) -> None:
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return
+            import torch.distributed as _dist
+
+            if _dist.is_initialized() and _dist.get_rank() != 0:
+                return
+            self._dump_workspace_record(
+                workspace,
+                tag={},
+                use_cuda_graph=bool(md.use_cuda_graph),
+                layer_id=int(layer.layer_id),
+                mode=md.mode,
+                cache_seqlens=md.cache_seqlens,
+                cu_seqlens_q=md.cu_seqlens_q,
+            )
+        except Exception as e:
+            logger.warning("b12x verify metadata dump failed: %s", e)
+
+    def _dump_workspace_record(
+        self,
+        workspace,
+        *,
+        tag,
+        use_cuda_graph,
+        layer_id,
+        mode,
+        cache_seqlens,
+        cu_seqlens_q,
+    ) -> None:
+        dump_dir = _os.environ.get("DFLASH_B12X_DUMP_DIR", "/cache/dflash_dumps")
+        _os.makedirs(dump_dir, exist_ok=True)
+        n = getattr(self, "_b12x_dump_counter", 0)
+        if n > 2400:
+            return
+        self._b12x_dump_counter = n + 1
+
+        def _t(x, limit=96):
+            if x is None:
+                return None
+            return x.reshape(-1)[:limit].detach().cpu().clone()
+
+        plan = getattr(workspace, "_plan", None)
+        plan_info = {}
+        if plan is not None:
+            for f in (
+                "total_q",
+                "causal",
+                "window_left",
+                "split_kv",
+                "cta_tile_q",
+                "gqa_group_size",
+                "kv_chunk_size",
+                "page_table_shape",
+                "num_qo_tiles",
+                "new_batch_size",
+            ):
+                v = getattr(plan, f, None)
+                if isinstance(v, torch.Tensor):
+                    v = _t(v, 16)
+                plan_info[f] = v
+        rec = {
+            "use_cuda_graph": bool(use_cuda_graph),
+            "layer_id": layer_id,
+            "mode": mode,
+            "tag": tag,
+            "is_draft": bool(getattr(self, "_is_draft_backend", False)),
+            "cache_seqlens": _t(cache_seqlens, 16),
+            "cu_seqlens_q": _t(cu_seqlens_q, 16),
+            "ws_cache_seqlens": _t(getattr(workspace, "cache_seqlens", None), 16),
+            "ws_cu_seqlens_q": _t(getattr(workspace, "cu_seqlens_q", None), 16),
+            "page_table_row0": _t(getattr(workspace, "page_table", None), 16),
+            "request_indices": _t(getattr(workspace, "request_indices", None)),
+            "qo_tile_indices": _t(getattr(workspace, "qo_tile_indices", None)),
+            "kv_tile_indices": _t(getattr(workspace, "kv_tile_indices", None)),
+            "block_valid_mask": _t(getattr(workspace, "block_valid_mask", None)),
+            "merge_indptr": _t(getattr(workspace, "merge_indptr", None), 32),
+            "o_indptr": _t(getattr(workspace, "o_indptr", None), 32),
+            "kv_chunk_size_ptr": _t(getattr(workspace, "kv_chunk_size_ptr", None), 4),
+            "kv_window_start_tokens": _t(
+                getattr(workspace, "kv_window_start_tokens", None), 16
+            ),
+            "total_num_rows_ptr": _t(getattr(workspace, "total_num_rows_ptr", None), 4),
+            "plan": plan_info,
+        }
+        torch.save(rec, _os.path.join(dump_dir, f"b12x{n}.pt"))
+
+    def _forward_encoder_only_extend(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        md: B12xForwardMetadata,
+        sinks: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Handle DFlash draft non-causal block attention.
+
+        B12X paged attention is causal-only for extend. DFlash draft layers are
+        encoder-only and require each draft token to attend over the whole
+        materialized draft context, including later tokens in the current block.
+        """
+
+        q3 = q.view(q.shape[0], layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+        k_flat = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_flat = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        output = torch.empty(
+            q.shape[0],
+            layer.tp_q_head_num,
+            layer.v_head_dim,
+            dtype=q.dtype,
+            device=q.device,
+        )
+
+        cu_q = md.cu_seqlens_q
+        req_pool_indices = forward_batch.req_pool_indices
+        cache_seqlens = md.cache_seqlens
+        req_to_token = self.req_to_token
+        gqa_group = max(1, int(layer.tp_q_head_num) // max(1, int(layer.tp_k_head_num)))
+
+        for i in range(int(req_pool_indices.shape[0])):
+            q_start = int(cu_q[i].item())
+            q_end = int(cu_q[i + 1].item())
+            if q_end <= q_start:
+                continue
+
+            cache_len = int(cache_seqlens[i].item())
+            if cache_len <= 0:
+                output[q_start:q_end].zero_()
+                continue
+
+            req_idx = int(req_pool_indices[i].item())
+            q_len = q_end - q_start
+            window_left = self._layer_window_left(layer)
+            if window_left >= 0:
+                # Match DFlash's non-causal SWA semantics: keep a bounded left
+                # context while still allowing every token in the current draft
+                # block to see the whole block, including later mask tokens.
+                kv_start = max(0, cache_len - q_len - int(window_left))
+            else:
+                kv_start = 0
+            token_locs = req_to_token[req_idx, kv_start:cache_len].to(torch.long)
+            k_req = k_flat.index_select(0, token_locs)
+            v_req = v_flat.index_select(0, token_locs)
+            if gqa_group > 1:
+                k_req = k_req.repeat_interleave(gqa_group, dim=1)
+                v_req = v_req.repeat_interleave(gqa_group, dim=1)
+
+            q_req = q3[q_start:q_end].transpose(0, 1).unsqueeze(0)
+            k_req = k_req.transpose(0, 1).unsqueeze(0)
+            v_req = v_req.transpose(0, 1).unsqueeze(0)
+            if sinks is None:
+                out_req = torch.nn.functional.scaled_dot_product_attention(
+                    q_req,
+                    k_req,
+                    v_req,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=float(layer.scaling),
+                )
+            else:
+                scores = torch.matmul(
+                    q_req.to(torch.float32), k_req.transpose(-2, -1).to(torch.float32)
+                )
+                scores.mul_(float(layer.scaling))
+                sink_scores = sinks.to(device=scores.device, dtype=torch.float32).view(
+                    1, -1, 1, 1
+                )
+                scores = torch.cat(
+                    [
+                        scores,
+                        sink_scores.expand(
+                            scores.shape[0], -1, scores.shape[2], 1
+                        ),
+                    ],
+                    dim=-1,
+                )
+                probs = torch.softmax(scores, dim=-1)[..., :-1].to(v_req.dtype)
+                out_req = torch.matmul(probs, v_req)
+            output[q_start:q_end].copy_(out_req.squeeze(0).transpose(0, 1))
+
+        return output.view(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
     def _require_forward_metadata(self, expected_mode: str) -> B12xForwardMetadata:
         if self.forward_metadata is None:
@@ -686,7 +954,7 @@ class B12xAttnBackend(AttentionBackend):
                 if md.swa_page_table is None
                 else getattr(self.swa_kv_pool, "full_to_swa_index_mapping", None)
             )
-            if md.swa_page_table is None or swa_index_mapping is not None:
+            if (md.swa_page_table is None or swa_index_mapping is not None) and _b12x_graph_replay_func("stage_decode_cuda_graph_metadata") is not None:
                 from b12x.attention.paged.graph_replay import (
                     stage_decode_cuda_graph_metadata,
                 )
@@ -849,6 +1117,9 @@ class B12xAttnBackend(AttentionBackend):
             swa_index_mapping = getattr(self.swa_kv_pool, "full_to_swa_index_mapping", None)
             if swa_index_mapping is None or swa_index_mapping.device != md.cache_seqlens.device:
                 return False
+
+        if _b12x_graph_replay_func("patch_decode_cuda_graph_current_pages") is None:
+            return False
 
         from b12x.attention.paged.graph_replay import (
             patch_decode_cuda_graph_current_pages,
@@ -1013,8 +1284,8 @@ class B12xAttnBackend(AttentionBackend):
                 self._page_table_for_layer(md, layer),
                 cache_seqlens,
                 cu_seqlens_q,
+                causal=self._layer_is_causal(layer),
                 window_left=self._layer_window_left(layer),
-                active_total_q=active_total_q,
             )
             prepared_keys.add(workspace_key)
         return frozenset(prepared_keys)
@@ -1088,6 +1359,21 @@ class B12xAttnBackend(AttentionBackend):
             getattr(self.server_args, "speculative_num_draft_tokens", None) or 1
         )
         return max(1, self._paged_decode_batch_capacity() * draft_tokens)
+
+    def _moe_extend_total_q_capacity(self) -> int:
+        max_prefill_tokens = max(
+            1, int(getattr(self.server_args, "max_prefill_tokens", 1) or 1)
+        )
+        chunked_prefill_size = max(
+            0, int(getattr(self.server_args, "chunked_prefill_size", 0) or 0)
+        )
+        decode_page_reserve = self._paged_decode_batch_capacity() * int(
+            self.page_size
+        )
+        capacity = max_prefill_tokens + chunked_prefill_size + decode_page_reserve
+        return ((capacity + int(self.page_size) - 1) // int(self.page_size)) * int(
+            self.page_size
+        )
 
     def _eager_extend_batch_capacity(self, total_q_capacity: int) -> int:
         configured_batch = self.server_args.prefill_max_requests
@@ -1219,6 +1505,7 @@ class B12xAttnBackend(AttentionBackend):
         head_dim_vo: int,
         num_q_heads: int,
         num_kv_heads: int,
+        causal: bool,
         window_left: int,
         num_cache_pages: int,
         runtime_page_table: torch.Tensor,
@@ -1229,7 +1516,10 @@ class B12xAttnBackend(AttentionBackend):
             if mode == "decode":
                 max_batch = max(1, int(bs))
                 max_page_table_width = self.max_pages_per_req
-                max_work_items = max_batch * self.max_pages_per_req
+                max_work_items = max(
+                    max_batch * self.max_pages_per_req,
+                    self._graph_block_valid_capacity(num_kv_heads=num_kv_heads),
+                )
                 max_partial_rows = max_work_items
             elif mode == "verify":
                 max_batch = max(1, int(bs))
@@ -1295,6 +1585,7 @@ class B12xAttnBackend(AttentionBackend):
                 mode=mode,
                 bs=bs,
                 total_q_capacity=total_q_capacity,
+                causal=causal,
                 window_left=window_left,
                 num_cache_pages=num_cache_pages,
                 runtime_page_table=runtime_page_table,
@@ -1415,17 +1706,26 @@ class B12xAttnBackend(AttentionBackend):
         from b12x.integration import (
             B12XJointArenaSpec,
             ensure_b12x_execution_lane_arena,
+            get_b12x_execution_lane,
         )
 
         paged_caps = self._build_paged_attention_arena_caps()
         moe_caps = self._build_b12x_moe_arena_caps(model_runner)
-        lane = ensure_b12x_execution_lane_arena(
-            B12XJointArenaSpec(
+        spec = B12XJointArenaSpec(
                 device=self.device,
                 paged_attention_caps=paged_caps,
                 moe_caps=moe_caps,
             )
-        )
+        try:
+            lane = ensure_b12x_execution_lane_arena(spec)
+        except RuntimeError:
+            if not getattr(model_runner, "is_draft_worker", False):
+                raise
+            lane = get_b12x_execution_lane(
+                self.device, create_standalone_moe_pool=False
+            )
+            if lane is None or lane.arena is None:
+                raise
         if lane.arena is None or lane.arena.paged_attention_arena is None:
             raise RuntimeError(
                 "b12x execution lane was allocated without paged attention arena"
@@ -1505,6 +1805,8 @@ class B12xAttnBackend(AttentionBackend):
             if value is None
         ]
         if missing:
+            if getattr(model_runner, "is_draft_worker", False):
+                return None
             raise ValueError(
                 "b12x joint arena cannot size MoE workspace; missing config fields: "
                 + ", ".join(missing)
@@ -1520,16 +1822,39 @@ class B12xAttnBackend(AttentionBackend):
 
         extend_total_q = self._eager_extend_total_q_capacity()
         decode_q = self._paged_decode_q_rows_capacity()
+        verify_total_q = self._eager_verify_total_q_capacity()
+        moe_extend_total_q = self._moe_extend_total_q_capacity()
+        # Attention scratch can cap eager extend at chunked_prefill_size, but
+        # the MoE core may still materialize for SGLang's max_prefill_tokens
+        # bucket during target forward/verify paths. SGLang's paged decode
+        # admission can also carry an adjacent chunk-sized extend bucket plus
+        # one page per running decode request. Size the shared MoE arena for
+        # that combined extend bucket so a later larger plan cannot outgrow it.
+        max_prefill_tokens = max(
+            1, int(getattr(self.server_args, "max_prefill_tokens", 1) or 1)
+        )
+        core_token_counts = (
+            extend_total_q,
+            decode_q,
+            verify_total_q,
+            max_prefill_tokens,
+            moe_extend_total_q,
+        )
+        # Size the shared arena with the w4a16 layout: the FP4 MoE runtime
+        # resolves a TPW4A16Workspace whose per-token core footprint (~114KB)
+        # is >2x the nvfp4 layout estimate (~52KB), so sizing with "nvfp4"
+        # makes large prefill chunks (>~7.5k tokens) overflow the arena at
+        # _map_core_workspace_views time.
         return B12XMoEArenaCaps(
             device=self.device,
             dtype=self.q_dtype,
-            quant_mode="nvfp4",
+            quant_mode="w4a16",
             weight_E=int(weight_E),
             k=int(hidden_size),
             n=intermediate_size // tp_size,
             num_topk=int(num_topk),
-            max_tokens=max(extend_total_q, decode_q),
-            core_token_counts=(extend_total_q, decode_q),
+            max_tokens=max(core_token_counts),
+            core_token_counts=core_token_counts,
             route_num_experts=int(weight_E),
             route_logits_dtype=self.q_dtype,
         )
@@ -1616,6 +1941,7 @@ class B12xAttnBackend(AttentionBackend):
         for layer in self.attention_layers:
             self._validate_layer_contract(layer)
             window_left = self._layer_window_left(layer)
+            causal = self._layer_is_causal(layer)
             layer_page_table = (
                 swa_page_table
                 if self._layer_uses_sliding_window_kv_pool(layer)
@@ -1638,6 +1964,7 @@ class B12xAttnBackend(AttentionBackend):
                     head_dim_vo=layer.v_head_dim,
                     num_q_heads=layer.tp_q_head_num,
                     num_kv_heads=layer.tp_k_head_num,
+                    causal=causal,
                     window_left=window_left,
                     num_cache_pages=self._num_cache_pages_for_layer(layer),
                     runtime_page_table=layer_page_table,
@@ -1677,6 +2004,7 @@ class B12xAttnBackend(AttentionBackend):
                         layer_page_table,
                         cache_seqlens,
                         cu_seqlens_q,
+                        causal=causal,
                         window_left=window_left,
                     )
         if mode == "decode":
@@ -1899,6 +2227,14 @@ class B12xAttnBackend(AttentionBackend):
         layers.sort(key=lambda layer: int(layer.layer_id))
         return layers
 
+    def _model_has_attention_sinks(self, model) -> bool:
+        if model is None:
+            return False
+        for module in model.modules():
+            if getattr(module, "attention_sink_bias", None) is not None:
+                return True
+        return False
+
     def _collect_eager_attention_layers(self) -> list:
         representatives = {}
         for layer in self.attention_layers:
@@ -1917,6 +2253,9 @@ class B12xAttnBackend(AttentionBackend):
         if window_left is None or int(window_left) < 0:
             return -1
         return int(window_left)
+
+    def _layer_is_causal(self, layer: RadixAttention) -> bool:
+        return getattr(getattr(layer, "attn_type", None), "value", None) != "encoder_only"
 
     def _expected_layer_head_dims(self, layer: RadixAttention) -> tuple[int, int]:
         if self._layer_window_left(layer) >= 0:
@@ -1967,6 +2306,7 @@ class B12xAttnBackend(AttentionBackend):
 
     def _eager_layer_key(self, layer: RadixAttention) -> tuple[object, ...]:
         return (
+            getattr(getattr(layer, "attn_type", None), "value", None),
             bool(self._layer_uses_sliding_window_kv_pool(layer)),
             int(layer.tp_q_head_num),
             int(layer.tp_k_head_num),
@@ -1987,6 +2327,7 @@ class B12xAttnBackend(AttentionBackend):
             return (*graph_key, *self._eager_layer_key(layer), bool(has_sinks))
         return (
             *graph_key,
+            getattr(getattr(layer, "attn_type", None), "value", None),
             int(layer.layer_id),
             int(layer.qk_head_dim),
             int(layer.v_head_dim),
@@ -2195,6 +2536,7 @@ class B12xAttnBackend(AttentionBackend):
                 and seq_lens.device.type == "cuda"
                 and self.req_to_token.device.type == "cuda"
                 and (swa_page_table is None or swa_index_mapping is not None)
+                and _b12x_graph_replay_func("stage_decode_cuda_graph_metadata") is not None
             )
             if not can_stage_with_b12x:
                 cache_seqlens.copy_(seq_lens[:bs].to(torch.int32))
@@ -2274,6 +2616,7 @@ class B12xAttnBackend(AttentionBackend):
         mode: str,
         bs: int,
         total_q_capacity: int,
+        causal: bool,
         window_left: int,
         num_cache_pages: int,
         runtime_page_table: torch.Tensor,
@@ -2295,12 +2638,20 @@ class B12xAttnBackend(AttentionBackend):
                 page_table=runtime_page_table,
             )
             return
+        max_cache_seqlen = min(
+            int(self.max_context_len), max(1, int(num_cache_pages)) * int(self.page_size)
+        )
+        if mode == "verify" and int(self.verify_graph_max_cache_seqlen) > 0:
+            max_cache_seqlen = min(
+                max_cache_seqlen, int(self.verify_graph_max_cache_seqlen)
+            )
         workspace.prepare_prefill_graph_replay_state(
             batch=bs,
             total_q_capacity=total_q_capacity,
             max_page_table_width=self.max_pages_per_req,
-            max_cache_seqlen=self.max_context_len,
+            max_cache_seqlen=max_cache_seqlen,
             cu_seqlens_q=cu_seqlens_q,
+            causal=causal,
             window_left=window_left,
         )
 

@@ -365,6 +365,7 @@ class DFlashVerifyInput(SpecInput):
                 )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
+        target_predict = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -383,7 +384,6 @@ class DFlashVerifyInput(SpecInput):
                 candidates=candidates,
                 target_predict=target_predict,
             )
-
         # Single D2H transfer: candidates[1:] + accept_len + bonus
         packed = torch.cat(
             [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
@@ -421,11 +421,17 @@ class DFlashVerifyInput(SpecInput):
                     "DFLASH verify cannot determine current token: both output_ids and origin_input_ids are empty."
                 )
 
-            commit_lens_cpu.append(appended)
+            # HF DFlash crops the target KV cache to `start + accept_len + 1`.
+            # The verify input is [current_token, draft_1, ...], so this commits
+            # the current token plus accepted drafts. The bonus token is emitted
+            # to output_ids but is forwarded as the current token in the next
+            # block; committing it here would map the wrong hidden/KV row.
+            commit_lens_cpu.append(min(acc_len + 1, appended))
             new_bonus_tokens_list.append(new_bonus_token)
-            num_accepted_drafts_per_req_cpu.append(max(0, appended - 1))
+            accepted_drafts = max(0, appended - 1)
+            num_accepted_drafts_per_req_cpu.append(accepted_drafts)
             req.spec_verify_ct += 1
-            req.spec_accepted_drafts += num_accepted_drafts_per_req_cpu[-1]
+            req.spec_accepted_drafts += accepted_drafts
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
         new_bonus_tokens = torch.tensor(

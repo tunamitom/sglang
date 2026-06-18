@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -32,6 +33,70 @@ from sglang.srt.speculative.dflash_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _dflash_layer_sliding_window_size(config, layer_id: int) -> int:
+    import os as _os
+
+    dflash_config = getattr(config, "dflash_config", {}) or {}
+
+    env_window = _os.environ.get("DFLASH_DRAFT_SWA_WINDOW")
+    if env_window:
+        try:
+            return int(env_window)
+        except ValueError:
+            return -1
+
+    # dflash_config takes priority over config.layer_types: HF Qwen3Config
+    # auto-materializes layer_types as all "full_attention" when config.json
+    # omits it (use_sliding_window defaults to False), which would silently
+    # disable the trained drafter's SWA (use_swa/swa_window_size).
+    if "use_swa" in dflash_config:
+        if not bool(dflash_config.get("use_swa")):
+            return -1
+        return int(
+            dflash_config.get(
+                "swa_window_size",
+                getattr(
+                    config,
+                    "sliding_window",
+                    getattr(config, "sliding_window_size", -1),
+                )
+                or -1,
+            )
+        )
+
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None and int(layer_id) < len(layer_types):
+        if layer_types[int(layer_id)] != "sliding_attention":
+            return -1
+        return int(
+            dflash_config.get(
+                "swa_window_size",
+                getattr(
+                    config,
+                    "sliding_window",
+                    getattr(config, "sliding_window_size", -1),
+                ),
+            )
+        )
+
+    if not bool(
+        dflash_config.get(
+            "use_swa", getattr(config, "sliding_window", None) is not None
+        )
+    ):
+        return -1
+    return int(
+        dflash_config.get(
+            "swa_window_size",
+            getattr(
+                config,
+                "sliding_window",
+                getattr(config, "sliding_window_size", -1),
+            ),
+        )
+    )
 
 
 class DFlashAttention(nn.Module):
@@ -90,7 +155,13 @@ class DFlashAttention(nn.Module):
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
-        rope_theta = float(getattr(config, "rope_theta", 1000000))
+        dflash_config = getattr(config, "dflash_config", {}) or {}
+        # The HF reference (dflash.py) builds Qwen3RotaryEmbedding from the draft
+        # config itself, i.e. rope_theta=10000 — NOT dflash_config.backbone_rotary_base
+        # (5e6, the target model's base). Offline teacher-forced acceptance against
+        # dumped target features: theta=10000 -> 3.0 accepted drafts/step,
+        # theta=5e6 -> 2.2.
+        rope_theta = float(getattr(config, "rope_theta", 10000))
         rope_scaling = getattr(config, "rope_scaling", None)
         rope_is_neox_style = bool(
             getattr(
@@ -98,6 +169,7 @@ class DFlashAttention(nn.Module):
             )
         )
         max_position_embeddings = int(getattr(config, "max_position_embeddings", 32768))
+        partial_rotary_factor = float(getattr(config, "partial_rotary_factor", 1.0))
         self.rotary_emb = get_rope(
             head_dim,
             rotary_dim=head_dim,
@@ -105,9 +177,11 @@ class DFlashAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
+            partial_rotary_factor=partial_rotary_factor,
         )
 
         self.scaling = head_dim**-0.5
+        self.v_scale = dflash_config.get("attention_value_scale", None)
         # DFlash uses non-causal attention over the draft block.
         self.attn = RadixAttention(
             num_heads=self.num_heads,
@@ -117,6 +191,13 @@ class DFlashAttention(nn.Module):
             layer_id=layer_id,
             attn_type=AttentionType.ENCODER_ONLY,
         )
+        sliding_window_size = _dflash_layer_sliding_window_size(config, layer_id)
+        if sliding_window_size is not None and int(sliding_window_size) > 0:
+            self.attn.sliding_window_size = int(sliding_window_size)
+        if bool(dflash_config.get("attention_sink_bias", False)):
+            self.attention_sink_bias = nn.Parameter(torch.empty(self.num_heads))
+        else:
+            self.attention_sink_bias = None
 
     def forward(
         self,
@@ -128,7 +209,11 @@ class DFlashAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        if self.v_scale is not None:
+            v = v * self.v_scale
+        attn_output = self.attn(
+            q, k, v, forward_batch, sinks=self.attention_sink_bias
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -150,11 +235,15 @@ class DFlashAttention(nn.Module):
             )
             kv = F.linear(hidden_states, weight, bias)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
+            if self.v_scale is not None:
+                v = v * self.v_scale
             return k, v
 
         # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
         qkv, _ = self.qkv_proj(hidden_states)
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.v_scale is not None:
+            v = v * self.v_scale
         return k, v
 
     def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:
@@ -373,8 +462,12 @@ class DFlashDraftModel(nn.Module):
                 if resolved_name is None:
                     continue
                 param = params_dict[resolved_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
+                if "attention_sink_bias" in resolved_name:
+                    start = get_attention_tp_rank() * param.numel()
+                    param.data.copy_(loaded_weight[start : start + param.numel()])
+                else:
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 resolved_name = resolve_param_name(name)
@@ -392,8 +485,12 @@ class DFlashDraftModel(nn.Module):
                         f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
                         f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
                     )
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if "attention_sink_bias" in resolved_name:
+                    start = get_attention_tp_rank() * param.numel()
+                    param.data.copy_(loaded_weight[start : start + param.numel()])
+                else:
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
 
 
 EntryClass = DFlashDraftModel

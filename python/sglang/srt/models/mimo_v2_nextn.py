@@ -48,6 +48,10 @@ from sglang.srt.models.mimo_v2 import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
+
+def _mimo_norm_eps(config: PretrainedConfig) -> float:
+    return getattr(config, "layernorm_epsilon", getattr(config, "rms_norm_eps", 1e-6))
+
 MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
@@ -85,13 +89,17 @@ class MiMoV2MTPLayer(nn.Module):
 
         self.self_attn = MiMoV2Attention(
             hidden_size=self.hidden_size,
-            num_heads=config.swa_num_attention_heads,
-            num_kv_heads=config.swa_num_key_value_heads,
-            head_dim=config.swa_head_dim,
-            v_head_dim=getattr(config, "swa_v_head_dim", None),
+            num_heads=getattr(config, "swa_num_attention_heads", config.num_attention_heads),
+            num_kv_heads=getattr(
+                config, "swa_num_key_value_heads", config.num_key_value_heads
+            ),
+            head_dim=getattr(config, "swa_head_dim", config.head_dim),
+            v_head_dim=getattr(
+                config, "swa_v_head_dim", getattr(config, "v_head_dim", None)
+            ),
             v_scale=getattr(config, "attention_value_scale", None),
-            sliding_window_size=config.sliding_window_size,
-            attention_bias=config.attention_bias,
+            sliding_window_size=getattr(config, "sliding_window_size", None),
+            attention_bias=getattr(config, "attention_bias", False),
             attention_sink_bias=getattr(config, "add_swa_attention_sink_bias", False),
             layer_id=layer_id,
             rope_theta=getattr(config, "swa_rope_theta", rope_theta),
@@ -119,9 +127,9 @@ class MiMoV2MTPLayer(nn.Module):
             tp_rank=mlp_tp_rank,
             tp_size=mlp_tp_size,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=_mimo_norm_eps(config))
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.layernorm_epsilon
+            config.hidden_size, eps=_mimo_norm_eps(config)
         )
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -186,8 +194,8 @@ class MiMoV2ModelNextN(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        self.enorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
-        self.hnorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+        self.enorm = RMSNorm(config.hidden_size, eps=_mimo_norm_eps(config))
+        self.hnorm = RMSNorm(config.hidden_size, eps=_mimo_norm_eps(config))
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
@@ -197,7 +205,7 @@ class MiMoV2ModelNextN(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix(f"mtp.layers.{draft_model_idx or 0}", prefix),
         )
-        self.final_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+        self.final_layernorm = RMSNorm(config.hidden_size, eps=_mimo_norm_eps(config))
 
     def forward(
         self,

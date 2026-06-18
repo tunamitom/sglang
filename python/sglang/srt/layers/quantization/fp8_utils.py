@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -428,6 +429,12 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_flashinfer_cutlass():
+        if _is_sm120_supported:
+            raise RuntimeError(
+                "FlashInfer CUTLASS block FP8 is disabled on SM120 because it "
+                "can produce denormal-scale outputs in dense projections. Use "
+                "--fp8-gemm-backend=cutlass for MiMo/DFlash on B12X."
+            )
         if not (is_blackwell_supported() and is_flashinfer_available()):
             raise RuntimeError(
                 "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_cutlass, "
@@ -491,17 +498,17 @@ def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
     # 1. DeepGEMM (if enabled and available)
-    # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
-    # 3. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
+    # 2. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
+    # 3. FlashInfer groupwise (if Blackwell GPU and FlashInfer available)
     # 4. AITER (if AMD GPU with AITER enabled)
     # 5. Triton (fallback)
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
-    elif is_blackwell_supported() and is_flashinfer_available():
-        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
     elif _check_cutlass_block_fp8_hardware_support():
         return cutlass_w8a8_block_fp8_linear_with_fallback
+    elif is_blackwell_supported() and is_flashinfer_available():
+        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
     else:
@@ -560,11 +567,17 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         block_n, block_k = block_size
         m, k = input_2d.shape
         n = weight.shape[0]
-        expected_x_scale_shape = (k // block_k, m)
-        expected_weight_scale_shape = (k // block_k, n // block_n)
-        if x_scale.shape == (m, k // block_k):
+        # Block-scaled checkpoints store one B scale per *ceil* output block.
+        # MiMo DFlash has dense projection sizes such as n=3392, which is not
+        # divisible by block_n=128.  Using floor division rejects the real
+        # checkpoint scale tensor `(ceil(n/block_n), k/block_k) == (27, 48)`.
+        k_blocks = ceil_div(k, block_k)
+        n_blocks = ceil_div(n, block_n)
+        expected_x_scale_shape = (k_blocks, m)
+        expected_weight_scale_shape = (k_blocks, n_blocks)
+        if x_scale.shape == (m, k_blocks):
             x_scale = x_scale.transpose(-1, -2).contiguous()
-        if weight_scale.shape == (n // block_n, k // block_k):
+        if weight_scale.shape == (n_blocks, k_blocks):
             weight_scale = weight_scale.transpose(-1, -2).contiguous()
         assert x_scale.shape == expected_x_scale_shape, (
             "FlashInfer CUTLASS groupwise FP8 expects A scale layout "
@@ -888,6 +901,11 @@ def triton_w8a8_block_fp8_linear(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
+_B12X_BLOCK_FP8_MAX_TOKENS = int(
+    os.getenv("SGLANG_B12X_BLOCK_FP8_MAX_TOKENS", "256")
+)
+
+
 def b12x_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -896,6 +914,16 @@ def b12x_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # The b12x MXFP8 kernel wins at decode/verify token counts but loses to
+    # the cutlass/triton path at prefill-chunk sizes; dispatch on row count.
+    if (
+        input_scale is None
+        and _B12X_BLOCK_FP8_MAX_TOKENS >= 0
+        and (input.numel() // input.shape[-1]) > _B12X_BLOCK_FP8_MAX_TOKENS
+    ):
+        return cutlass_w8a8_block_fp8_linear_with_fallback(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
     if input_scale is not None:
         raise RuntimeError(
             "b12x block FP8 linear expects BF16/FP16 activations and does not "

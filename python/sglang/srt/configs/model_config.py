@@ -310,6 +310,25 @@ class ModelConfig:
             else:
                 enable_multimodal = True
 
+        # Local MiMo-DFlash text-only checkpoint workaround: the HF config class
+        # can auto-populate audio/vision subconfigs even when this checkpoint is
+        # served as CausalLM text-only. If left enabled, SGLang builds the MiMo
+        # multimodal processor/vision tower and trips B12X MM-attention imports.
+        quantization_config_for_mm = getattr(self.hf_config, "quantization_config", None)
+        if (
+            enable_multimodal is True
+            and getattr(self.hf_config, "model_type", None) == "mimo_v2"
+            and isinstance(quantization_config_for_mm, dict)
+            and quantization_config_for_mm.get("quant_method") == "fp8"
+            and quantization_config_for_mm.get("store_dtype") == "mxfp4"
+        ):
+            enable_multimodal = False
+            if hasattr(self.hf_config, "vision_config"):
+                self.hf_config.vision_config = None
+            if hasattr(self.hf_config, "audio_config"):
+                self.hf_config.audio_config = None
+            logger.info("Multimodal is disabled for text-only MiMo FP4/DFlash checkpoint.")
+
         # Config draft model
         self._config_draft_model()
 
@@ -340,6 +359,23 @@ class ModelConfig:
             n_group = getattr(self.hf_config, "n_group", None)
             if n_group is not None:
                 self.hf_config.topk_group = n_group
+
+        # MiMo-V2.5-Pro-FP4-DFlash advertises quant_method=fp8 but stores routed
+        # experts in native MXFP4. Treat only the routed experts as FP4 so the
+        # existing FP8 dense/attention path is preserved while B12X can prepare
+        # the W4A16 MXFP4 MoE weights.
+        quantization_config = getattr(self.hf_config, "quantization_config", None)
+        if (
+            getattr(self.hf_config, "model_type", None) == "mimo_v2"
+            and isinstance(quantization_config, dict)
+            and quantization_config.get("quant_method") == "fp8"
+            and quantization_config.get("store_dtype") == "mxfp4"
+        ):
+            self.is_fp4_experts = True
+            logger.info(
+                "Auto-detected MiMo routed-expert layout: is_fp4_experts=%s",
+                self.is_fp4_experts,
+            )
 
         # Check model type
         self.attention_chunk_size = getattr(
@@ -671,6 +707,30 @@ class ModelConfig:
             "swa_v_head_dim",
             self.swa_head_dim,
         )
+
+        # Local MiMo DFlash draft configs can come through as Qwen3Config and
+        # lack MiMo SWA aliases while downstream hybrid-SWA code still expects
+        # them on hf_text_config. Materialize conservative aliases from the
+        # standard Qwen/MiMo attention fields so draft KV-pool setup and MTP
+        # layers agree.
+        for _cfg in (self.hf_text_config, self.hf_config):
+            if not hasattr(_cfg, "head_dim"):
+                setattr(_cfg, "head_dim", self.head_dim)
+            if not hasattr(_cfg, "v_head_dim"):
+                setattr(_cfg, "v_head_dim", self.v_head_dim)
+            if not hasattr(_cfg, "swa_head_dim"):
+                setattr(_cfg, "swa_head_dim", self.swa_head_dim)
+            if not hasattr(_cfg, "swa_v_head_dim"):
+                setattr(_cfg, "swa_v_head_dim", self.swa_v_head_dim)
+            if not hasattr(_cfg, "swa_num_attention_heads") and hasattr(
+                _cfg, "num_attention_heads"
+            ):
+                setattr(_cfg, "swa_num_attention_heads", _cfg.num_attention_heads)
+            if not hasattr(_cfg, "swa_num_key_value_heads") and hasattr(
+                _cfg, "num_key_value_heads"
+            ):
+                setattr(_cfg, "swa_num_key_value_heads", _cfg.num_key_value_heads)
+
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures

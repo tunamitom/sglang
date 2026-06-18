@@ -819,20 +819,32 @@ class CudaGraphRunner:
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
-        is_ngram_supported = (
+        is_fixed_token_verify_supported = (
             (
                 forward_batch.batch_size * self.num_tokens_per_bs
                 == forward_batch.input_ids.numel()
             )
-            if self.model_runner.spec_algorithm.is_ngram()
+            if (
+                self.model_runner.spec_algorithm.is_ngram()
+                or self.model_runner.spec_algorithm.is_dflash()
+            )
             else True
         )
+        attn_backend_can_replay = True
+        can_run_attn_backend_graph = getattr(
+            self.attn_backend, "can_run_cuda_graph_replay", None
+        )
+        if callable(can_run_attn_backend_graph):
+            attn_backend_can_replay = bool(
+                can_run_attn_backend_graph(forward_batch, self.capture_forward_mode)
+            )
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
-            and is_ngram_supported
+            and is_fixed_token_verify_supported
+            and attn_backend_can_replay
         )
 
     def _init_profile_context_and_memory_record(self):
@@ -1193,7 +1205,11 @@ class CudaGraphRunner:
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
-            attn_backend.on_after_cuda_graph_warmup()
+            on_after_cuda_graph_warmup = getattr(
+                attn_backend, "on_after_cuda_graph_warmup", None
+            )
+            if on_after_cuda_graph_warmup is not None:
+                on_after_cuda_graph_warmup()
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
