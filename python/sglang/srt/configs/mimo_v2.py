@@ -1,6 +1,5 @@
 from copy import deepcopy
 
-from transformers import CONFIG_MAPPING
 from transformers.configuration_utils import PretrainedConfig
 
 
@@ -269,15 +268,3 @@ class MiMoV2Config(PretrainedConfig):
 
 
 __all__ = ["MiMoV2Config"]
-
-
-# Register with transformers' CONFIG_MAPPING so AutoConfig.from_pretrained() resolves
-# model_type="mimo_v2" to this vendored config natively. This removes the need for
-# --trust-remote-code: the model dir's configuration_mimo_v2.py is no longer consulted,
-# and the in-repo MiMoV2ForCausalLM / MiMoV2MTP / DFlashDraftModel classes are already
-# discovered via their EntryClass registrations (the draft model is plain qwen3).
-try:
-    CONFIG_MAPPING.register("mimo_v2", MiMoV2Config)
-except Exception:
-    # Already registered, or this transformers version rejects re-registration.
-    CONFIG_MAPPING._extra_content["mimo_v2"] = MiMoV2Config
